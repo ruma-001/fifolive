@@ -46,7 +46,7 @@ Indian live sellers currently:
 ### Using the launcher (recommended)
 
 ```bash
-git clone https://github.com/ruchitha/fifolive.git
+git clone https://github.com/<your-username>/fifolive.git
 cd fifolive
 
 chmod +x run.sh
@@ -56,7 +56,7 @@ chmod +x run.sh
 ### Manual setup
 
 ```bash
-git clone https://github.com/ruchitha/fifolive.git
+git clone https://github.com/<your-username>/fifolive.git
 cd fifolive
 
 python3 -m venv .venv
