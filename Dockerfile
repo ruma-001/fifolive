@@ -12,5 +12,5 @@ COPY main.py .
 # Expose port
 EXPOSE 8000
 
-# Run the app
-CMD ["python", "main.py"]
+# Run the app (respects $PORT if set by platform)
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -13,9 +13,15 @@ import json
 import uuid
 import time
 import asyncio
+import os
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 from contextlib import asynccontextmanager, contextmanager
+
+try:
+    import psycopg2
+except ImportError:
+    psycopg2 = None
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -25,19 +31,49 @@ from pydantic import BaseModel
 import uvicorn
 
 # ------------------------- CONFIG -------------------------
-DB_PATH = "fifolive.db"
+DB_PATH = os.environ.get("DB_PATH", "fifolive.db")
 APP_NAME = "FIFOLive"
 LIVE_TITLE = "Summer Collection Live • 2.4k watching"
 
 # ------------------------- DB SETUP -------------------------
+# Simple adapter to support both SQLite and PostgreSQL with the same queries.
+# PostgreSQL connection string from env: DATABASE_URL (Heroku, etc.)
+
+class _CursorWrapper:
+    def __init__(self, cursor, is_postgres):
+        self._cursor = cursor
+        self._is_postgres = is_postgres
+
+    def execute(self, sql, params=()):
+        if self._is_postgres and params:
+            sql = sql.replace("?", "%s")
+        return self._cursor.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
 def get_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+    db_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+    if db_url and psycopg2 is not None:
+        # Heroku sometimes gives postgres:// , psycopg prefers postgresql://
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+        conn = psycopg2.connect(db_url)
+        conn.autocommit = False
+        return conn
+    else:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
 
 def init_db():
     conn = get_db()
     c = conn.cursor()
+    is_postgres = "psycopg" in str(type(conn)).lower()
+
+    # Use the wrapper for consistent execute behavior
+    c = _CursorWrapper(c, is_postgres)
+
     c.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id TEXT PRIMARY KEY,
@@ -62,6 +98,8 @@ def init_db():
             payment_ref TEXT,
             payment_method TEXT,
             payment_details TEXT,
+            delivery_address TEXT,
+            tracking_number TEXT,
             notes TEXT
         )
     """)
@@ -74,23 +112,23 @@ def init_db():
             is_order INTEGER DEFAULT 0
         )
     """)
-    # Lightweight migration for existing DBs
-    try:
-        c.execute("ALTER TABLE orders ADD COLUMN payment_method TEXT")
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE orders ADD COLUMN payment_details TEXT")
-    except Exception:
-        pass
+    # Lightweight migration for existing DBs (works for both)
+    for col in ["payment_method", "payment_details", "delivery_address", "tracking_number"]:
+        try:
+            c.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT")
+        except Exception:
+            pass
     conn.commit()
     conn.close()
 
 @contextmanager
 def db_cursor():
     conn = get_db()
+    is_postgres = "psycopg" in str(type(conn)).lower()
+    cursor = conn.cursor()
+    wrapped = _CursorWrapper(cursor, is_postgres)
     try:
-        yield conn.cursor()
+        yield wrapped
         conn.commit()
     finally:
         conn.close()
@@ -190,7 +228,7 @@ def get_pending_orders() -> List[Dict]:
         ).fetchall()
         return [dict(r) for r in rows]
 
-def create_order(customer_name: str, product_id: str, qty: int) -> Dict:
+def create_order(customer_name: str, product_id: str, qty: int, delivery_address: Optional[str] = None) -> Dict:
     prod = get_product(product_id)
     if not prod:
         raise HTTPException(404, "Product not found")
@@ -207,9 +245,9 @@ def create_order(customer_name: str, product_id: str, qty: int) -> Dict:
     new_reserved = prod["stock_reserved"] + qty
     with db_cursor() as c:
         c.execute(
-            """INSERT INTO orders (id, created_at, customer_name, product_id, qty, total_price, status, payment_ref)
-               VALUES (?, ?, ?, ?, ?, ?, 'requested', NULL)""",
-            (order_id, now, customer_name, product_id, qty, total)
+            """INSERT INTO orders (id, created_at, customer_name, product_id, qty, total_price, status, payment_ref, delivery_address)
+               VALUES (?, ?, ?, ?, ?, ?, 'requested', NULL, ?)""",
+            (order_id, now, customer_name, product_id, qty, total, delivery_address)
         )
         c.execute(
             "UPDATE products SET stock_reserved = ? WHERE id = ?",
@@ -226,6 +264,7 @@ def create_order(customer_name: str, product_id: str, qty: int) -> Dict:
         "total_price": total,
         "status": "requested",
         "payment_ref": None,
+        "delivery_address": delivery_address,
     }
 
     broadcast({"type": "new_order", "order": order, "product": new_prod})
@@ -234,7 +273,8 @@ def create_order(customer_name: str, product_id: str, qty: int) -> Dict:
     return order
 
 def update_order_status(order_id: str, status: str, payment_ref: Optional[str] = None, 
-                          payment_method: Optional[str] = None, payment_details: Optional[str] = None) -> Dict:
+                          payment_method: Optional[str] = None, payment_details: Optional[str] = None,
+                          tracking_number: Optional[str] = None) -> Dict:
     with db_cursor() as c:
         sets = ["status = ?"]
         params = [status]
@@ -248,6 +288,9 @@ def update_order_status(order_id: str, status: str, payment_ref: Optional[str] =
         if payment_details is not None:
             sets.append("payment_details = ?")
             params.append(payment_details)
+        if tracking_number is not None:
+            sets.append("tracking_number = ?")
+            params.append(tracking_number)
         
         params.append(order_id)
         sql = f"UPDATE orders SET {', '.join(sets)} WHERE id = ?"
@@ -270,8 +313,8 @@ def fulfill_order(order_id: str) -> Dict:
             raise HTTPException(404, "Order not found")
         order = dict(row)
 
-        if order["status"] not in ("paid", "accepted"):
-            raise HTTPException(400, "Order must be paid or accepted to fulfill")
+        if order["status"] not in ("paid", "accepted", "shipped"):
+            raise HTTPException(400, "Order must be paid, accepted or shipped to fulfill")
 
         prod = get_product(order["product_id"])
         if not prod:
@@ -363,6 +406,7 @@ class OrderRequest(BaseModel):
     customer_name: str
     product_id: str
     qty: int
+    delivery_address: Optional[str] = None
 
 class SimulateMessage(BaseModel):
     customer_name: str
@@ -389,7 +433,7 @@ def api_pending():
 
 @app.post("/api/order-request")
 def api_place_order(req: OrderRequest):
-    order = create_order(req.customer_name, req.product_id, req.qty)
+    order = create_order(req.customer_name, req.product_id, req.qty, req.delivery_address)
     # Also log as a message
     prod = get_product(req.product_id)
     msg_text = f"ORDER: {req.qty}x {prod['name']} (₹{order['total_price']})"
@@ -419,7 +463,7 @@ def api_simulate(msg: SimulateMessage):
                 break
         if matched:
             try:
-                order = create_order(msg.customer_name, matched["id"], qty)
+                order = create_order(msg.customer_name, matched["id"], qty, JSON.stringify({name: msg.customer_name, phone: "9999999999", address: "Simulated Address"}))
                 return {"success": True, "message": new_msg, "order": order}
             except Exception as e:
                 pass
@@ -440,6 +484,18 @@ def api_pay_order(order_id: str):
     if not order:
         raise HTTPException(404)
     return {"success": True, "order": order, "payment_ref": ref}
+
+
+@app.post("/api/ship-order/{order_id}")
+def api_ship_order(order_id: str, payload: dict):
+    """Mark order as shipped with tracking number."""
+    tracking = payload.get("tracking_number", "").strip()
+    if not tracking:
+        raise HTTPException(400, "Tracking number is required")
+    order = update_order_status(order_id, "shipped", tracking_number=tracking)
+    if not order:
+        raise HTTPException(404, "Order not found")
+    return {"success": True, "order": order}
 
 
 class PaymentInitiate(BaseModel):
@@ -976,6 +1032,24 @@ INDEX_HTML = """
                             </button>
                         </div>
                         <div class="text-xs text-zinc-500 mt-1">Your request is timestamped and enters the FIFO queue.</div>
+                    </div>
+
+                    <!-- Delivery Address -->
+                    <div class="mt-5 pt-4 border-t border-zinc-800">
+                        <div class="flex justify-between items-center mb-2 px-0.5">
+                            <div class="section-header text-emerald-400">Delivery Address</div>
+                            <button onclick="saveDeliveryAddress()" class="text-[10px] px-2 py-0.5 bg-emerald-800 text-emerald-300 rounded">Save</button>
+                        </div>
+                        <div class="space-y-1.5 text-xs">
+                            <input id="deliv-name" placeholder="Full Name" class="w-full bg-zinc-950 border border-zinc-700 px-2 py-1 rounded text-xs">
+                            <input id="deliv-phone" placeholder="Phone Number" class="w-full bg-zinc-950 border border-zinc-700 px-2 py-1 rounded text-xs">
+                            <textarea id="deliv-address" placeholder="Full Address (House, Street, City, State, Pincode)" rows="2" class="w-full bg-zinc-950 border border-zinc-700 px-2 py-1 rounded text-xs"></textarea>
+                            <div class="flex gap-1">
+                                <button onclick="detectLocation()" class="flex-1 text-[10px] py-1 bg-zinc-800 hover:bg-zinc-700 rounded">📍 Detect Location</button>
+                                <button onclick="loadDeliveryAddress()" class="flex-1 text-[10px] py-1 bg-zinc-800 hover:bg-zinc-700 rounded">Load Saved</button>
+                            </div>
+                        </div>
+                        <div id="deliv-status" class="text-[10px] text-emerald-400 mt-1 px-0.5"></div>
                     </div>
 
                     <!-- Saved Payment Methods -->
@@ -1572,10 +1646,10 @@ INDEX_HTML = """
             container.innerHTML = '';
             
             const pending = orders
-                .filter(o => ['requested', 'accepted'].includes(o.status))
+                .filter(o => ['requested', 'accepted', 'paid', 'shipped'].includes(o.status))
                 .sort((a,b) => a.created_at - b.created_at);
             
-            document.getElementById('queue-count').innerText = `${pending.length} in queue`;
+            document.getElementById('queue-count').innerText = `${pending.length} active`;
             
             if (pending.length === 0) {
                 container.innerHTML = `<div class="text-sm text-center py-6 text-zinc-500 bg-zinc-950 border border-zinc-800 rounded-3xl">No pending orders. FIFO queue is clear.</div>`;
@@ -1593,6 +1667,10 @@ INDEX_HTML = """
                 let statusPill = '';
                 if (order.status === 'accepted') {
                     statusPill = `<span class="px-2 text-xs py-px rounded-full bg-sky-900 text-sky-300 font-bold">ACCEPTED</span>`;
+                } else if (order.status === 'paid') {
+                    statusPill = `<span class="px-2 text-xs py-px rounded-full bg-emerald-900 text-emerald-300 font-bold">PAID</span>`;
+                } else if (order.status === 'shipped') {
+                    statusPill = `<span class="px-2 text-xs py-px rounded-full bg-sky-900 text-sky-300 font-bold">SHIPPED</span>`;
                 } else {
                     statusPill = `<span class="px-2 text-xs py-px rounded-full bg-amber-900 text-amber-300 font-bold">PENDING</span>`;
                 }
@@ -1615,6 +1693,14 @@ INDEX_HTML = """
                                 <span class="text-zinc-400">${timeAgo}</span>
                                 <span class="font-mono text-emerald-400">₹${order.total_price}</span>
                             </div>
+                            ${(order.delivery_address && ['accepted','paid','shipped'].includes(order.status)) ? `
+                            <div class="mt-1 text-[10px] text-amber-300 bg-zinc-900 px-1 py-0.5 rounded" title="${typeof order.delivery_address === 'string' ? order.delivery_address : JSON.stringify(order.delivery_address)}">
+                                📦 Ship to: ${typeof order.delivery_address === 'string' ? order.delivery_address.substring(0,55) + '…' : (order.delivery_address.name || '') + ', ' + (order.delivery_address.address || '').substring(0,40)}
+                            </div>` : ''}
+                            ${order.tracking_number ? `
+                            <div class="mt-0.5 text-[10px] text-sky-300 bg-zinc-900 px-1 py-0.5 rounded">
+                                🚚 Tracking: <span class="font-mono">${order.tracking_number}</span>
+                            </div>` : ''}
                         </div>
                     </div>
                     
@@ -1623,15 +1709,24 @@ INDEX_HTML = """
                             <button onclick="acceptOrder('${order.id}')" 
                                     class="text-xs px-4 py-1 font-extrabold bg-teal-700 hover:bg-teal-600 transition-colors rounded-2xl">
                                 ACCEPT + LOCK
-                            </button>` : `
+                            </button>` : order.status === 'accepted' ? `
                             <button onclick="payForCustomer('${order.id}')" 
                                     class="text-xs px-4 py-1 font-bold bg-sky-700 hover:bg-sky-600 transition-colors rounded-2xl">
                                 PAY NOW
-                            </button>`}
+                            </button>` : order.status === 'paid' ? `
+                            <button onclick="markAsShipped('${order.id}')" 
+                                    class="text-xs px-4 py-1 font-bold bg-orange-700 hover:bg-orange-600 transition-colors rounded-2xl">
+                                MARK SHIPPED
+                            </button>` : order.status === 'shipped' ? `
+                            <button onclick="fulfillOrder('${order.id}')" 
+                                    class="text-xs px-4 py-1 font-bold bg-emerald-700 hover:bg-emerald-600 transition-colors rounded-2xl">
+                                MARK COMPLETED
+                            </button>` : ''}
                         
                         <div class="flex gap-x-1">
+                            ${['paid','shipped'].includes(order.status) ? `
                             <button onclick="fulfillOrder('${order.id}')" 
-                                    class="text-xs px-3 py-px text-emerald-400 hover:text-emerald-300 transition-colors font-bold">FULFILL</button>
+                                    class="text-xs px-3 py-px text-emerald-400 hover:text-emerald-300 transition-colors font-bold">FULFILL</button>` : ''}
                             <button onclick="cancelOrder('${order.id}')" 
                                     class="text-xs px-1 text-red-400 hover:text-red-300">×</button>
                         </div>
@@ -1671,6 +1766,21 @@ INDEX_HTML = """
                 await fetch(`/api/pay-order/${orderId}`, {method: 'POST'});
                 refreshAll();
             }
+        }
+        
+        async function markAsShipped(orderId) {
+            const tracking = prompt("Enter tracking number:");
+            if (!tracking || !tracking.trim()) return;
+            const res = await fetch(`/api/ship-order/${orderId}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ tracking_number: tracking.trim() })
+            });
+            if (!res.ok) {
+                const err = await res.json();
+                alert(err.detail || 'Could not mark as shipped');
+            }
+            refreshAll();
         }
         
         async function fulfillOrder(orderId) {
@@ -1746,13 +1856,19 @@ INDEX_HTML = """
             let qty = parseInt(document.getElementById('quick-qty').value) || 1;
             if (!prodId) return;
             
+            const deliv = getCurrentDeliveryAddress();
+            if (!deliv || !deliv.address) {
+                alert("Please fill and Save your Delivery Address (below Quick Order) before placing an order.");
+                return;
+            }
             await fetch('/api/order-request', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
                     customer_name: currentCustomerName,
                     product_id: prodId,
-                    qty: qty
+                    qty: qty,
+                    delivery_address: deliv ? JSON.stringify(deliv) : null
                 })
             });
             
@@ -1762,13 +1878,19 @@ INDEX_HTML = """
         }
         
         async function requestOrderFromCustomer(productId, qty) {
+            const deliv = getCurrentDeliveryAddress();
+            if (!deliv || !deliv.address) {
+                alert("Please fill and Save your Delivery Address (in the Delivery Address section) before placing an order.");
+                return;
+            }
             await fetch('/api/order-request', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
                     customer_name: currentCustomerName,
                     product_id: productId,
-                    qty: qty
+                    qty: qty,
+                    delivery_address: deliv ? JSON.stringify(deliv) : null
                 })
             });
             document.getElementById('my-orders-panel').classList.remove('hidden');
@@ -1850,7 +1972,8 @@ INDEX_HTML = """
                         body: JSON.stringify({
                             customer_name: names[i % names.length],
                             product_id: p.id,
-                            qty: (i % 2) + 1
+                            qty: (i % 2) + 1,
+                            delivery_address: JSON.stringify({ name: names[i % names.length], phone: "9999999999", address: "Demo Address, City, 560001" })
                         })
                     });
                 }, i * 420);
@@ -1891,6 +2014,82 @@ INDEX_HTML = """
             if (myPanel && currentRole === 'customer') myPanel.classList.remove('hidden');
 
             renderSavedMethods('saved-methods-list');
+            renderDeliveryAddress();
+        }
+        
+        // ==================== DELIVERY ADDRESS (Customer) ====================
+        function getCurrentDeliveryAddress() {
+            const name = document.getElementById('deliv-name')?.value?.trim() || '';
+            const phone = document.getElementById('deliv-phone')?.value?.trim() || '';
+            const addr = document.getElementById('deliv-address')?.value?.trim() || '';
+            if (!name && !phone && !addr) return null;
+            return { name, phone, address: addr };
+        }
+
+        function saveDeliveryAddress() {
+            if (!currentCustomerName) {
+                alert("Please set your customer name first (top of customer panel)");
+                return;
+            }
+            const addr = getCurrentDeliveryAddress();
+            if (!addr || (!addr.name && !addr.phone && !addr.address)) {
+                alert("Please fill at least one field");
+                return;
+            }
+            const key = `fifolive_deliv_${currentCustomerName}`;
+            localStorage.setItem(key, JSON.stringify(addr));
+            const status = document.getElementById('deliv-status');
+            if (status) status.textContent = '✅ Address saved for this customer name';
+            setTimeout(() => { if (status) status.textContent = ''; }, 2000);
+        }
+
+        function loadDeliveryAddress() {
+            if (!currentCustomerName) return;
+            const key = `fifolive_deliv_${currentCustomerName}`;
+            const raw = localStorage.getItem(key);
+            if (!raw) {
+                const status = document.getElementById('deliv-status');
+                if (status) status.textContent = 'No saved address for this name';
+                return;
+            }
+            try {
+                const addr = JSON.parse(raw);
+                const nameEl = document.getElementById('deliv-name');
+                const phoneEl = document.getElementById('deliv-phone');
+                const addrEl = document.getElementById('deliv-address');
+                if (nameEl) nameEl.value = addr.name || '';
+                if (phoneEl) phoneEl.value = addr.phone || '';
+                if (addrEl) addrEl.value = addr.address || '';
+                const status = document.getElementById('deliv-status');
+                if (status) status.textContent = 'Loaded saved address';
+                setTimeout(() => { if (status) status.textContent = ''; }, 1500);
+            } catch(e) {}
+        }
+
+        function detectLocation() {
+            if (!navigator.geolocation) {
+                alert("Geolocation not supported by your browser");
+                return;
+            }
+            navigator.geolocation.getCurrentPosition(pos => {
+                const { latitude, longitude } = pos.coords;
+                const addrEl = document.getElementById('deliv-address');
+                const note = ` [Location: ${latitude.toFixed(4)}, ${longitude.toFixed(4)} - verify on map]`;
+                if (addrEl) {
+                    addrEl.value = (addrEl.value || '') + note;
+                }
+                const status = document.getElementById('deliv-status');
+                if (status) status.textContent = 'Location captured (demo - please add full address)';
+            }, err => {
+                alert("Could not get location: " + err.message);
+            });
+        }
+
+        function renderDeliveryAddress() {
+            // Load saved if customer name known
+            if (currentRole === 'customer' && currentCustomerName) {
+                loadDeliveryAddress();
+            }
         }
         
         function switchRole(role) {
@@ -2546,6 +2745,8 @@ INDEX_HTML = """
                     action = `<button onclick='payMyOrder("${order.id}")' class="text-xs px-3 py-1 rounded-2xl bg-emerald-600 font-bold">PAY NOW</button>`;
                 } else if (order.status === 'paid') {
                     action = `<span class="font-bold text-emerald-400 text-xs">PAID — waiting for vendor</span>`;
+                } else if (order.status === 'shipped') {
+                    action = `<span class="font-bold text-sky-400 text-xs">SHIPPED 🚚 ${order.tracking_number ? order.tracking_number : ''}</span>`;
                 } else if (order.status === 'completed') {
                     action = `<span class="font-bold text-teal-400 text-xs">COMPLETED ✓</span>`;
                 } else if (order.status === 'failed') {
@@ -2559,6 +2760,8 @@ INDEX_HTML = """
                         <span class="font-medium">${order.qty}× ${prod ? prod.name : ''}</span>
                         <span class="font-mono ml-2 text-emerald-400">₹${order.total_price}</span><br>
                         <span class="text-xs text-zinc-500">${formatTimeAgo(order.created_at)}</span>
+                        ${order.delivery_address ? `<div class="text-[10px] text-amber-300 mt-0.5">📍 ${typeof order.delivery_address === 'string' ? order.delivery_address.substring(0,50) : (order.delivery_address.name||'') + ', ' + (order.delivery_address.address||'')}</div>` : ''}
+                        ${order.tracking_number ? `<div class="text-[10px] text-sky-300 mt-0.5">🚚 Tracking: <span class="font-mono">${order.tracking_number}</span></div>` : ''}
                     </div>
                     <div>${action}</div>
                 `;
@@ -2730,6 +2933,7 @@ def api_add_product(body: NewProduct):
 
 # ------------------------- RUN -------------------------
 if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
     print(f"Starting {APP_NAME}...")
-    print("Open http://localhost:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
+    print(f"Open http://0.0.0.0:{port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, reload=False)
