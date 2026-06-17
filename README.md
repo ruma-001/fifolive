@@ -209,6 +209,70 @@ Heroku is great for quick Python deploys. We provide:
 
 Update any local `localhost:8000` references in docs/tests when sharing the live URL.
 
+### PostgreSQL Migration Notes
+
+The app currently uses SQLite for simplicity. For production or reliable persistence on platforms like Heroku, switch to PostgreSQL.
+
+**1. Add dependency**
+```bash
+pip install psycopg2-binary
+```
+(Already listed in requirements.txt for convenience.)
+
+**2. Set DATABASE_URL**
+Heroku:
+```bash
+heroku addons:create heroku-postgresql:essential-0
+```
+(or use the free hobby-dev tier if available). Heroku will set `DATABASE_URL` automatically.
+
+Locally with Docker Compose example (add to docker-compose.yml):
+```yaml
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: fifolive
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: fifolive
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+  web:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://fifolive:secret@db:5432/fifolive
+    depends_on:
+      - db
+volumes:
+  pgdata:
+```
+
+**3. Code changes (already done)**
+- `main.py` detects `DATABASE_URL` / `POSTGRES_URL`.
+- Uses `psycopg2` when available and falls back to SQLite.
+- Placeholder conversion (`?` → `%s`) is handled automatically.
+- All queries and schema creation are compatible.
+- Lightweight migrations (ALTER) are wrapped in try/except.
+
+**4. Run / Deploy**
+- Local: `DATABASE_URL=postgresql://... python main.py`
+- Heroku: just push after adding the addon. The first deploy will run `init_db()` which creates tables.
+- Existing SQLite data will not be migrated automatically. For production, either:
+  - Start fresh, or
+  - Write a one-time migration script to copy data.
+
+**5. Notes & Gotchas**
+- Use connection pooling in real prod (e.g. pgbouncer or SQLAlchemy with pool).
+- For high scale, consider SQLAlchemy or async drivers (asyncpg + FastAPI).
+- The `init_db()` + ALTERs work for both engines.
+- Test thoroughly: `DATABASE_URL=... ./run.sh`
+- On Heroku, after adding Postgres, you can promote it:
+  ```bash
+  heroku pg:promote DATABASE_URL
+  ```
+
+This keeps the app working with zero or minimal changes while giving you proper persistence.
+
 ## Running Tests
 
 ```bash
