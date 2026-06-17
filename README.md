@@ -161,15 +161,51 @@ Test the full flows: customer orders, payments (Razorpay test mode works over th
 | Railway    | Easy GitHub, volumes, credits     | Free tier generous             |
 | Fly.io     | Containers + volumes              | Free limited machines          |
 | ngrok (temp) | Quick public tunnel            | Run locally: `ngrok http 8000` (not persistent) |
-| Heroku     | Classic Python support         | Uses included Procfile: `web: uvicorn main:app --host 0.0.0.0 --port $PORT` |
+| Heroku     | Classic Python support         | Uses `Procfile` + `runtime.txt` (see dedicated section below) |
 
-### Post-Deploy Tips
-- Test end-to-end in browser.
-- For test scripts against remote: temporarily edit `BASE`/`WS_URL` in `tests/*.py`.
-- Free tiers may have limits/sleep; monitor usage.
-- The demo is open (no auth) — perfect for testing.
-- WebSockets work on these platforms.
-- **Heroku**: The included `Procfile` (`web: uvicorn main:app --host 0.0.0.0 --port $PORT`) makes deploy simple after `heroku create` and `git push heroku main`. Heroku sets `$PORT`.
+### Heroku Deployment (Specific Instructions)
+
+Heroku is great for quick Python deploys. We provide:
+
+- `Procfile`: `web: uvicorn main:app --host 0.0.0.0 --port $PORT`
+- `runtime.txt`: Specifies Python 3.11
+
+**Steps:**
+
+1. Make sure you have the `Procfile` and `runtime.txt` in your repo (they are included).
+
+2. Create a Heroku app:
+   ```bash
+   heroku create your-app-name
+   git push heroku main
+   ```
+
+3. (Optional but recommended) Set the port explicitly if needed (Heroku provides `$PORT` automatically):
+   ```bash
+   heroku config:set PORT=8000
+   ```
+
+4. **Important: SQLite on Heroku**
+   - Heroku's filesystem is **ephemeral**. The `fifolive.db` will be lost on every dyno restart or deploy.
+   - For real testing with persistence:
+     - Use a paid Heroku Postgres add-on and update the app to use PostgreSQL (future enhancement).
+     - Or accept data loss between restarts for demo purposes.
+   - Current app uses `DB_PATH` env var — you can experiment with it, but SQLite won't persist reliably.
+
+5. Scale and open:
+   ```bash
+   heroku open
+   ```
+
+6. View logs:
+   ```bash
+   heroku logs --tail
+   ```
+
+**Notes for Heroku:**
+- The app seeds initial products on first run (or when DB is empty).
+- All demo features (FIFO, payments with test keys, WebSockets, receipts) work out of the box.
+- Free dynos sleep after 30 minutes of inactivity.
 
 Update any local `localhost:8000` references in docs/tests when sharing the live URL.
 
