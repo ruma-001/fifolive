@@ -133,6 +133,46 @@ Visit http://localhost:8000
 
 Note: The app seeds sample data on first run.
 
+## Deploying Online for Testing
+
+To make the app publicly accessible for others to test (without everyone needing local setup):
+
+### Code Updates for Deployment (required)
+The app must respect platform environment variables:
+- `PORT` (most platforms set this; defaults to 8000).
+- `DB_PATH` (for SQLite persistence via disk; defaults to `fifolive.db`).
+
+These are already supported in the current code.
+
+### Recommended: Render.com (Free tier, easy GitHub + Docker)
+1. Push your code to GitHub (repo already set up).
+2. Go to [render.com](https://render.com), sign up, "New > Web Service".
+3. Connect your GitHub repo and select `fifolive`.
+4. Runtime: **Docker** (uses existing Dockerfile).
+5. Add a **Persistent Disk** (e.g. 1GB) mounted at `/data`.
+6. Set Environment Variable: `DB_PATH=/data/fifolive.db`.
+7. Deploy! Your app will be at `https://your-app.onrender.com`.
+
+Test the full flows: customer orders, payments (Razorpay test mode works over the internet), vendor queue, etc.
+
+### Alternatives
+| Platform   | Why Good                          | Notes                          |
+|------------|-----------------------------------|--------------------------------|
+| Railway    | Easy GitHub, volumes, credits     | Free tier generous             |
+| Fly.io     | Containers + volumes              | Free limited machines          |
+| ngrok (temp) | Quick public tunnel            | Run locally: `ngrok http 8000` (not persistent) |
+| Heroku     | Classic Python support         | Uses included Procfile: `web: uvicorn main:app --host 0.0.0.0 --port $PORT` |
+
+### Post-Deploy Tips
+- Test end-to-end in browser.
+- For test scripts against remote: temporarily edit `BASE`/`WS_URL` in `tests/*.py`.
+- Free tiers may have limits/sleep; monitor usage.
+- The demo is open (no auth) — perfect for testing.
+- WebSockets work on these platforms.
+- **Heroku**: The included `Procfile` (`web: uvicorn main:app --host 0.0.0.0 --port $PORT`) makes deploy simple after `heroku create` and `git push heroku main`. Heroku sets `$PORT`.
+
+Update any local `localhost:8000` references in docs/tests when sharing the live URL.
+
 ## Running Tests
 
 ```bash
