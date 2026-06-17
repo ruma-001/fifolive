@@ -111,6 +111,42 @@ You can customize this in the frontend code.
 - SQLite
 - Tailwind + Vanilla JS (no build step)
 
+## Docker
+
+Build and run with Docker:
+
+```bash
+# Build
+docker build -t fifolive .
+
+# Run
+docker run -p 8000:8000 fifolive
+```
+
+Or with docker-compose:
+
+```bash
+docker-compose up --build
+```
+
+Visit http://localhost:8000
+
+Note: The app seeds sample data on first run.
+
+## Running Tests
+
+```bash
+# Start the app first
+./run.sh
+
+# In another terminal
+python tests/test_multi_user.py
+python tests/test_websocket.py
+./tests/test_docker.sh
+```
+
+Note: `test_multi_user.py` and `test_websocket.py` require the `requests` package (`pip install requests`).
+
 ## License
 
 MIT

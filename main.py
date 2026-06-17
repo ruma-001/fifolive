@@ -12,9 +12,10 @@ import sqlite3
 import json
 import uuid
 import time
+import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Any
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -126,11 +127,19 @@ class LiveMessage(BaseModel):
 active_connections: List[WebSocket] = []
 
 def broadcast(data: dict):
-    """Send to all connected clients."""
+    """Send to all connected clients using the captured main loop."""
     to_remove = []
-    for ws in active_connections:
+    loop = main_event_loop
+
+    for ws in list(active_connections):
         try:
-            ws.send_json(data)
+            if loop:
+                loop.create_task(ws.send_json(data))
+            else:
+                try:
+                    ws.send_json(data)
+                except Exception:
+                    pass
         except Exception:
             to_remove.append(ws)
     for ws in to_remove:
@@ -334,6 +343,17 @@ def seed_data_if_empty():
 app = FastAPI(title=APP_NAME)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
+
+main_event_loop = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global main_event_loop
+    main_event_loop = asyncio.get_running_loop()
+    print("[APP] Captured main event loop for broadcasts")
+    yield
+
+app.router.lifespan_context = lifespan
 
 init_db()
 seed_data_if_empty()
@@ -1356,6 +1376,7 @@ INDEX_HTML = """
         
         let currentRole = 'vendor';
         let currentCustomerName = 'Alex Sharma';
+        let currentSavedMethod = null;
         let ws = null;
         let products = [];
         let orders = [];
@@ -1937,6 +1958,7 @@ INDEX_HTML = """
             currentPaymentMethod = 'upi';
             selectedWallet = null;
             currentOrderAmount = order.total_price;
+            currentSavedMethod = null;  // clear previous selection when opening new payment
 
             const modal = document.getElementById('payment-modal');
             modal.classList.remove('hidden');
@@ -1966,6 +1988,7 @@ INDEX_HTML = """
             m.classList.add('hidden');
             m.classList.remove('flex');
             currentPayingOrderId = null;
+            currentSavedMethod = null;
         }
 
         function selectPaymentTab(tab) {
@@ -2051,21 +2074,34 @@ INDEX_HTML = """
             let processingText = "Processing payment...";
 
             if (method === 'upi') {
-                const vpa = document.getElementById('upi-vpa')?.value || 'customer@oksbi';
-                payload.details = { vpa, provider: 'UPI' };
-                processingText = `Paying ₹${currentOrderAmount} via UPI (${vpa})`;
+                if (currentSavedMethod && currentSavedMethod.method === 'upi' && currentSavedMethod.details.vpa) {
+                    payload.details = { ...currentSavedMethod.details, provider: 'UPI' };
+                } else {
+                    const vpa = document.getElementById('upi-vpa')?.value || 'customer@oksbi';
+                    payload.details = { vpa, provider: 'UPI' };
+                }
+                processingText = `Paying ₹${currentOrderAmount} via UPI (${payload.details.vpa})`;
             } else if (method === 'card') {
-                const num = (document.getElementById('card-number')?.value || '4111111111111111').replace(/\\s/g, "");
-                const last4 = num.slice(-4);
-                payload.details = { 
-                    card_last4: last4, 
-                    card_type: num.startsWith('4') ? 'Visa' : 'RuPay/Mastercard',
-                    name: document.getElementById('card-name')?.value || 'Demo User'
-                };
-                processingText = `Charging card •••• ${last4}`;
+                // If a saved card was selected, use its clean details
+                if (currentSavedMethod && currentSavedMethod.method === 'card' && currentSavedMethod.details.card_last4) {
+                    payload.details = { ...currentSavedMethod.details };
+                } else {
+                    const num = (document.getElementById('card-number')?.value || '4111111111111111').replace(/\\s/g, "");
+                    const last4 = num.slice(-4);
+                    payload.details = { 
+                        card_last4: last4, 
+                        card_type: num.startsWith('4') ? 'Visa' : 'RuPay/Mastercard',
+                        name: document.getElementById('card-name')?.value || 'Demo User'
+                    };
+                }
+                processingText = `Charging card •••• ${payload.details.card_last4 || '****'}`;
             } else if (method === 'wallet') {
-                payload.details = { wallet: selectedWallet || 'paytm' };
-                processingText = `Paying via ${selectedWallet || 'Wallet'}`;
+                if (currentSavedMethod && currentSavedMethod.method === 'wallet') {
+                    payload.details = { ...currentSavedMethod.details };
+                } else {
+                    payload.details = { wallet: selectedWallet || 'paytm' };
+                }
+                processingText = `Paying via ${payload.details.wallet || selectedWallet || 'Wallet'}`;
             }
 
             showToast(processingText);
@@ -2088,13 +2124,20 @@ INDEX_HTML = """
                 // Save the method for future use (repeat customer)
                 savePaymentMethod(method, payload.details);
 
+                // Ensure the saved list in customer panel is refreshed immediately
+                renderSavedMethods('saved-methods-list');
+
                 const methodLabel = method.toUpperCase();
                 showToast(`Payment successful via ${methodLabel}! Ref: ${data.payment_ref}`);
 
                 // Show beautiful receipt
                 setTimeout(() => showReceipt(paidOrder, { method, ...payload.details, ref: data.payment_ref }), 450);
+
+                // Clear any pre-selected saved method
+                currentSavedMethod = null;
             } catch (e) {
                 showToast("Payment failed. Please try again.");
+                currentSavedMethod = null;
             }
         }
 
@@ -2199,8 +2242,10 @@ INDEX_HTML = """
                         refreshAll();
 
                         savePaymentMethod('razorpay', { gateway: 'razorpay' });
+                        renderSavedMethods('saved-methods-list');
                         showToast(`Payment successful via Razorpay! Ref: ${result.order?.payment_ref || 'PAID'}`);
                         setTimeout(() => showReceipt(paidOrder, { method: 'razorpay', ref: result.order?.payment_ref || 'RAZORPAY' }), 500);
+                        currentSavedMethod = null;
                     },
                     modal: {
                         ondismiss: function () {
@@ -2322,37 +2367,46 @@ INDEX_HTML = """
 
         function savePaymentMethod(method, details) {
             if (!currentCustomerName) return;
-            const methods = loadSavedMethods();
-            const entry = { 
-                id: Date.now(), 
-                method, 
-                details: { ...details },
-                saved_at: Date.now()
-            };
+            let methods = loadSavedMethods();
 
-            // Avoid exact duplicates for simple cards/VPA
-            const exists = methods.find(m => 
+            // Find if this exact method+details already exists (to update/touch it)
+            const idx = methods.findIndex(m => 
                 m.method === method && 
                 JSON.stringify(m.details) === JSON.stringify(details)
             );
-            if (!exists) {
+
+            if (idx !== -1) {
+                // Touch: move to top and update timestamp ("update" the saved method)
+                const existing = methods[idx];
+                existing.saved_at = Date.now();
+                methods.splice(idx, 1);
+                methods.unshift(existing);
+            } else {
+                const entry = { 
+                    id: Date.now(), 
+                    method, 
+                    details: { ...details },
+                    saved_at: Date.now()
+                };
                 methods.unshift(entry); // newest first
                 if (methods.length > 5) methods.pop(); // keep max 5
-                localStorage.setItem(getSavedMethodsKey(), JSON.stringify(methods));
             }
-            // Refresh UI if customer panel visible
-            setTimeout(renderSavedMethods, 300);
+
+            localStorage.setItem(getSavedMethodsKey(), JSON.stringify(methods));
+            renderSavedMethods('saved-methods-list');
         }
 
         function deleteSavedMethod(id) {
             const methods = loadSavedMethods().filter(m => m.id !== id);
             localStorage.setItem(getSavedMethodsKey(), JSON.stringify(methods));
-            renderSavedMethods();
+            renderSavedMethods('saved-methods-list');
         }
 
         function useSavedMethod(saved) {
+            currentSavedMethod = saved;
+
             if (!currentPayingOrderId) {
-                // If no active payment, just prefill for next time
+                // If no active payment, just remember for next time
                 showToast("Saved for next payment");
                 return;
             }
@@ -2360,7 +2414,6 @@ INDEX_HTML = """
             closePaymentModal(); // close current if open
             setTimeout(() => {
                 // Reopen payment modal and pre-apply
-                // Fetch order again
                 fetch('/api/orders').then(r => r.json()).then(data => {
                     const ord = data.orders.find(o => o.id === currentPayingOrderId);
                     if (!ord) return;
@@ -2374,7 +2427,11 @@ INDEX_HTML = """
                         } else if (saved.method === 'card' || saved.method === 'razorpay') {
                             selectPaymentTab('card');
                             const cnum = document.getElementById('card-number');
-                            if (cnum && saved.details.card_last4) cnum.value = `•••• •••• •••• ${saved.details.card_last4}`;
+                            if (cnum && saved.details.card_last4) {
+                                // Show as placeholder, do not pollute .value with non-digits
+                                cnum.value = '';
+                                cnum.placeholder = `•••• •••• •••• ${saved.details.card_last4}`;
+                            }
                         } else if (saved.method === 'wallet') {
                             selectPaymentTab('wallet');
                             selectedWallet = saved.details.wallet || 'paytm';
@@ -2411,25 +2468,6 @@ INDEX_HTML = """
                 `;
             }).join('');
         }
-
-        // Patch openPaymentModal to show saved methods hint
-        const _origOpenPayment = openPaymentModal;
-        openPaymentModal = function(order) {
-            _origOpenPayment(order);
-            // After opening, optionally show a small saved bar if any
-            setTimeout(() => {
-                const saved = loadSavedMethods();
-                if (saved.length > 0) {
-                    const bar = document.createElement('div');
-                    bar.className = 'text-[10px] text-emerald-400 mt-2 cursor-pointer';
-                    bar.innerHTML = `💳 Use saved method (${saved.length})`;
-                    bar.onclick = () => {
-                        const list = document.getElementById('saved-quick-list');
-                        if (list) list.classList.toggle('hidden');
-                    };
-                }
-            }, 400);
-        };
 
         function getProductName(pid) {
             const p = products.find(x => x.id === pid);
