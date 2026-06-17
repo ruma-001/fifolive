@@ -231,22 +231,6 @@ MIT
 
 Built to solve real problems for live sellers in India. Contributions welcome!
 
-## How to Demo (Recommended Flow)
-
-1. Keep default view = **Vendor**.
-2. Click the **Customer** button (top) to switch (or use a second tab).
-3. As a Customer:
-   - Click **REQUEST ORDER** on any product, or use "Quick Order".
-   - Or type in Live Chat (e.g. "ORDER 2 T-Shirt").
-4. Watch the order instantly appear in the **FIFO Priority Queue** (top of the list).
-5. As Vendor:
-   - Click **ACCEPT + LOCK** on the top order.
-   - Then **MARK PAID** (or switch to Customer view and click "PAY VIA UPI").
-6. Complete with **FULFILL** — watch stock drop in real time everywhere.
-7. Try ordering the same product with a second "customer" — the first one stays on top and has the stock locked.
-
-Use the simulation buttons ("Simulate comment", "3 fast orders") to create a busy queue and prove FIFO priority.
-
 ## Core Features
 
 - **True FIFO Queue**: Always sorted by creation time (oldest first). No "latest message on top" problem.
